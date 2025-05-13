@@ -68,7 +68,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Unable to create temporary file", err)
 	}
-	defer os.Remove("tubely-upload.mp4")
+	defer os.Remove(tempFile.Name())
 	defer tempFile.Close()
 
 	_, err = io.Copy(tempFile, file)
@@ -80,6 +80,21 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "Unable to reset file pointer", err)
 	}
 
+	videoAspectRatio, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to get video properties", err)
+	}
+
+	processedVideoFile, err := processVideoForFastStart(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to process video", err)
+	}
+	processedFile, err := os.Open(processedVideoFile)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to open video file", err)
+	}
+	defer processedFile.Close()
+
 	contentTypeParts := strings.Split(mediaType, "/")
 	fileExtension := contentTypeParts[len(contentTypeParts)-1]
 
@@ -89,12 +104,21 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	base64.RawURLEncoding.Encode(randomNameURL, randomName)
 	randomNameString := string(randomNameURL)
 
-	filename := fmt.Sprintf("%s.%s", randomNameString, fileExtension)
+	var prefix string
+	switch videoAspectRatio {
+	case "16:9":
+		prefix = "landscape/"
+	case "9:16":
+		prefix = "portrait/"
+	default:
+		prefix = "other/"
+	}
+	filename := fmt.Sprintf("%s%s.%s", prefix, randomNameString, fileExtension)
 
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(filename),
-		Body:        tempFile,
+		Body:        processedFile,
 		ContentType: aws.String(mediaType),
 	})
 	if err != nil {
@@ -102,7 +126,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, filename)
+	videoURL := fmt.Sprintf("%s/%s", cfg.s3CfDistribution, filename)
 	metaData.VideoURL = &videoURL
 
 	err = cfg.db.UpdateVideo(metaData)
